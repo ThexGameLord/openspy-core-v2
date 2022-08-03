@@ -32,6 +32,6 @@ jobs:
       # Runs a set of commands using the runners shell
       - name: Run a multi-line script
         run: |
-          cd openspy-core-v2/docker-support/
+          cd /docker-support
           chmod u+x ./run.sh
           ./run.sh
