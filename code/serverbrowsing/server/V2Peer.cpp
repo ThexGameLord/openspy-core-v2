@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <OS/Net/NetServer.h>
 #include <stdarg.h>
+#include <filter/CToken.h>
 
 #define QR2_USE_QUERY_CHALLENGE 128
 
@@ -22,6 +23,7 @@ namespace SB {
 		m_last_list_req.m_from_game.gameid = 0;
 		m_last_list_req.m_from_game.secretkey[0] = 0;
 		m_last_list_req.m_from_game.gamename[0] = 0;
+		m_last_list_req.push_updates = false;
 		m_in_message = false;
 		m_got_game_pair = false;
 		mp_push_delay_buffer = NULL;
@@ -244,7 +246,7 @@ namespace SB {
 			buffer.WriteInt(getAddress().GetInAddr().sin_addr.s_addr);
 		}
 		
-		buffer.WriteShort(htons(list_req.m_from_game.queryport));
+		buffer.WriteShort(htons(list_req.m_for_game.queryport));
 
 		if(!list_req.no_server_list) {
 			buffer.WriteByte((uint8_t)list_req.field_list.size());
@@ -379,6 +381,7 @@ namespace SB {
 		req.req.m_from_game = m_last_list_req.m_from_game;
 		req.req.m_for_game = m_last_list_req.m_for_game;
 		m_last_list_req = req.req;
+		m_last_list_req_token_list = CToken::filterToTokenList(m_last_list_req.filter.c_str());
 
 		if (!m_got_game_pair || std::string(m_last_list_req.m_for_game.gamename).compare(req.req.m_for_gamename) != 0) {
 			req.type = MM::EMMQueryRequestType_GetGameInfoPairByGameName;
@@ -424,7 +427,6 @@ namespace SB {
 			else {
 				req.type = MM::EMMQueryRequestType_GetServers;
 			}
-			req.req.all_keys = true; //required for localip0, etc, TODO: find way that doesn't require retrieving full keys
 			m_in_message = true;
 			AddRequest(req);
 		}
@@ -444,6 +446,10 @@ namespace SB {
 
 		MM::MMQueryRequest req;
 		req.address = address;
+		
+		req.req.all_keys = true;
+		req.req.all_player_keys = true;
+		req.req.all_team_keys = true;
 
 		req.type = MM::EMMQueryRequestType_GetServerByIP;
 		req.address = address;
@@ -453,6 +459,7 @@ namespace SB {
 		AddRequest(req);
 	}
 	void V2Peer::send_ping() {
+		if (m_in_message) return;
 		//check for timeout
 		struct timeval current_time;
 
@@ -471,16 +478,11 @@ namespace SB {
 	void V2Peer::think(bool waiting_packet) {
 		NetIOCommResp io_resp;
 		if (m_delete_flag) return;
-		if (waiting_packet) {
-			OS::Buffer recv_buffer;
-			io_resp = this->GetDriver()->getNetIOInterface()->streamRecv(m_sd, recv_buffer);
-			
-			int len = io_resp.comm_len;
-
-			if (len <= 0) {
-				goto end;
-			}
-
+		OS::Buffer recv_buffer;
+		io_resp = this->GetDriver()->getNetIOInterface()->streamRecv(m_sd, recv_buffer);
+		
+		int len = io_resp.comm_len;
+		if (len > 0) {	
 			if(m_next_packet_send_msg) {
 				OS::LogText(OS::ELogLevel_Info, "[%s] Got msg length: %d", getAddress().ToString().c_str(), len);
 				MM::MMQueryRequest req;
@@ -493,10 +495,9 @@ namespace SB {
 				m_next_packet_send_msg = false;
 			} else {
 				this->handle_packet(recv_buffer);
-			}
-		}
-
-		end:
+			}		
+        }
+        
 		send_ping();
 
 		//check for timeout
@@ -612,7 +613,7 @@ namespace SB {
 						/*
 							This optimziation works on HAS_KEY_FLAG only
 						*/
-						if(type == KEYTYPE_STRING && m_last_list_req.push_updates == false)
+						if(type == KEYTYPE_STRING && push == false)
 							buffer->WriteByte(0xFF); //string index, -1 = no index
 						if (value.length() > 0) {
 
@@ -764,29 +765,11 @@ namespace SB {
 
 
 	void V2Peer::OnRetrievedServers(const MM::MMQueryRequest request, MM::ServerListQuery results, void *extra) {
-		if(request.req.push_updates == true) {
-			if(results.first_set) {
-				MM::ServerListQuery empty_results = results;
-				empty_results.list = std::vector<MM::Server *>();
-				empty_results.last_set = true;
-				SendListQueryResp(empty_results, request.req);
-			}
-
-			if (!m_sent_push_keys) {
-				m_sent_push_keys = true;
-				SendPushKeys();
-			}
-
-			std::vector<MM::Server*>::iterator it = results.list.begin();
-			while (it != results.list.end()) {
-				MM::Server* server = *it;
-				sendServerData(server, true, true, NULL, false, NULL, false, false);
-				it++;
-			}
-
-		} else {
-			SendListQueryResp(results, request.req, true);
-		}
+        SendListQueryResp(results, request.req, true);
+        if (!m_sent_push_keys && results.last_set) {
+            m_sent_push_keys = true;
+            SendPushKeys();
+        }
 
 	}
 	void V2Peer::OnRetrievedGroups(const MM::MMQueryRequest request, MM::ServerListQuery results, void *extra) {
@@ -800,4 +783,3 @@ namespace SB {
 		}
 	}
 }
-

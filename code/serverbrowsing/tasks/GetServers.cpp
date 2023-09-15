@@ -6,426 +6,583 @@
 
 namespace MM {
     bool PerformGetServers(MMQueryRequest request, TaskThreadData *thread_data) {
-			GetServers(thread_data, &request.req, &request);
+			GetServers(thread_data, &request);
 			if(request.peer)
 				request.peer->DecRef();
 			return true;
     }
 
-	ServerListQuery GetServers(TaskThreadData *thread_data, const sServerListReq *req, const MMQueryRequest *request) {
+	void GetServers(TaskThreadData *thread_data, const MMQueryRequest *request) {
 		ServerListQuery ret;
+		redisReply* reply = (redisReply *) redisCommand(thread_data->mp_redis_connection, "SELECT %d", OS::ERedisDB_QR);
+		if(!reply) {
+			return;
+		}
+		freeReplyObject(reply);
 
-		Redis::Response reply;
-		Redis::Value v, arr;
-
-		ret.requested_fields = req->field_list;
-
-		Redis::SelectDb(thread_data->mp_redis_connection, OS::ERedisDB_QR);
-		
 		int cursor = 0;
 		bool sent_servers = false;
+        
+        int peer_version = 0;
 
+        if(request && request->peer) {
+            peer_version = request->peer->GetVersion();
+        }
 		do {
 			ServerListQuery streamed_ret;
-			streamed_ret.requested_fields = ret.requested_fields;
-			reply = Redis::Command(thread_data->mp_redis_connection, 0, "ZSCAN %s %d", req->m_for_game.gamename.c_str(), cursor);
-			if (Redis::CheckError(reply))
-				goto error_cleanup;
+			streamed_ret.requested_fields = request->req.field_list;
+			reply =  (redisReply *) redisCommand(thread_data->mp_redis_connection, "ZSCAN %s %d COUNT 50", request->req.m_for_game.gamename.c_str(), cursor);
 
-			streamed_ret.last_set = false;
-			if (cursor == 0) {
-				streamed_ret.first_set = true;
-			} else {
-				streamed_ret.first_set = false;
-			}
-			if (reply.values[0].arr_value.values.size() < 2) {
+            if (reply == NULL || thread_data->mp_redis_connection->err) {
+                goto error_cleanup;
+            }
+			if (reply->elements < 2) {
 				goto error_cleanup;
 			}
-			v = reply.values[0].arr_value.values[0].second;
-			arr = reply.values[0].arr_value.values[1].second;
 
-		 	if(v.type == Redis::REDIS_RESPONSE_TYPE_STRING) {
-		 		cursor = atoi(v.value._str.c_str());
-		 	} else if (v.type == Redis::REDIS_RESPONSE_TYPE_INTEGER) {
-		 		cursor = v.value._int;
+		 	if(reply->element[0]->type == REDIS_REPLY_STRING) {
+		 		cursor = atoi(reply->element[0]->str);
+		 	} else if (reply->element[0]->type == REDIS_REPLY_INTEGER) {
+		 		cursor = reply->element[0]->integer;
 		 	}
 
-			if (cursor == 0) {
+			std::vector<std::string> server_keys;
+			for(size_t i=0;i<reply->element[1]->elements;i += 2) {
+			 	std::string server_key = reply->element[1]->element[i]->str;
+			 	server_keys.push_back(server_key);
+			}
+
+
+			AppendServerEntries(thread_data, server_keys, &streamed_ret, &request->req, peer_version);
+
+			if(cursor == 0) {
 				streamed_ret.last_set = true;
 			}
 
-			for(size_t i=0;i<arr.arr_value.values.size();i+=2) {
-				std::string server_key = arr.arr_value.values[i].second.value._str;
-				reply = Redis::Command(thread_data->mp_redis_connection, 0, "EXISTS %s", server_key.c_str());
-				
-				if (Redis::CheckError(reply) || reply.values.size() == 0) {
-					continue;
-				}
-				else {
-					v = reply.values[0];
-					if ((v.type == Redis::REDIS_RESPONSE_TYPE_INTEGER && v.value._int == 0) || (v.type == Redis::REDIS_RESPONSE_TYPE_STRING && v.value._str.compare("0") == 0)) {
-						Redis::Command(thread_data->mp_redis_connection, 0, "ZREM %s \"%s\"", req->m_for_game.gamename.c_str(), server_key.c_str());
-						continue;
-					}
-				}
-
-				if (request) {
-					AppendServerEntry(thread_data, server_key, &streamed_ret, req->all_keys, false, req);
-				}
-				else {
-					AppendServerEntry(thread_data, server_key, &ret, req->all_keys, false, req);
-				}
-			}
 			if (request && (!streamed_ret.list.empty() || streamed_ret.last_set)) {
 				if (!sent_servers) {
 					streamed_ret.first_set = true;
 					sent_servers = true;
 				}
-				//printf("Add server req first: %d last: %d numservmp_redis_connections: %d, cursor: %d\n", streamed_ret.first_set, streamed_ret.last_set, streamed_ret.list.size(), cursor);
 				request->peer->OnRetrievedServers(*request, streamed_ret, request->extra);
 			}
 
 			FreeServerListQuery(&streamed_ret);
+
+			freeReplyObject(reply);
 		} while(cursor != 0);
+        reply = NULL;
 
 		error_cleanup:
-			return ret;
+        if(reply != NULL) {
+            freeReplyObject(reply);
+        }
+        return;
 	}
-	void AppendServerEntry(TaskThreadData *thread_data, std::string entry_name, ServerListQuery *ret, bool all_keys, bool include_deleted, const sServerListReq *req) {
-		Redis::Response reply;
-		int cursor = 0;
+
+	void BuildServerListRequestData(const sServerListReq* req, std::vector<std::string>& basic_lookup_keys, std::vector<std::string>& lookup_keys, std::vector<CToken> &out_token_list, int peer_version) {
+		std::vector<CToken> token_list;
+
+		if (req != NULL) {
+			token_list = CToken::filterToTokenList(req->filter.c_str());
+			out_token_list.insert(out_token_list.end(), token_list.begin(), token_list.end());
+		}
+
+		basic_lookup_keys.push_back("deleted");
+		basic_lookup_keys.push_back("gameid");
+		basic_lookup_keys.push_back("id");
+		basic_lookup_keys.push_back("wan_port");
+		basic_lookup_keys.push_back("wan_ip");
+		basic_lookup_keys.push_back("icmp_address");
+		basic_lookup_keys.push_back("allow_unsolicited_udp");
+		basic_lookup_keys.push_back("country");
+
+		if (req == NULL) {
+			return;
+		}
+
+		std::vector<std::string>::const_iterator field_it = req->field_list.begin();
+		while (field_it != req->field_list.end()) {
+			const std::string field = *field_it;
+			lookup_keys.push_back(field);
+			field_it++;
+		}
+        
+		std::vector<CToken>::iterator itf = token_list.begin();
+		while (itf != token_list.end()) {
+			CToken token = *itf;
+			if (token.getType() == EToken_Variable) {
+				lookup_keys.push_back(token.getString());
+			}
+			itf++;
+		}
+        
+        if(peer_version == 2) {
+            const char *injected_custom_keys[] = {"localport", "localip0", "natneg"};
+            for(int i=0;i<sizeof(injected_custom_keys) / sizeof(const char *);i++) {
+                lookup_keys.push_back(injected_custom_keys[i]);
+            }
+        }
+
+	}
+
+	void AppendServerEntries_AllKeys(TaskThreadData* thread_data, std::vector<std::string> server_keys, ServerListQuery* query_response, const sServerListReq* req) {
+		std::vector<std::string> basic_lookup_keys;
+
+		std::vector<std::string> lookup_keys;
+
+		std::vector<CToken> token_list;
+
+		redisReply *reply = (redisReply *) redisCommand(thread_data->mp_redis_connection, "SELECT %d", OS::ERedisDB_QR);
+		freeReplyObject(reply);
+
+		BuildServerListRequestData(req, basic_lookup_keys, lookup_keys, token_list, 0);
+
+		std::ostringstream cmds;
+        
+        std::vector<std::string> keys_to_delete;
+
+		std::vector<std::string>::iterator it = server_keys.begin();
+		while (it != server_keys.end()) {
+			std::string server_key = *it;
+            
+            int num_basic_keys = 2 + basic_lookup_keys.size();
+            const char **args = (const char **)malloc(num_basic_keys * sizeof(const char *));
+            args[0] = "HMGET";
+            args[1] = server_key.c_str();
+            
+            int idx = 2;
+            
+            std::vector<std::string>::iterator keys_it = basic_lookup_keys.begin();
+            while (keys_it != basic_lookup_keys.end()) {
+                std::string key = *keys_it;
+                args[idx++] = strdup(key.c_str());
+                keys_it++;
+            }
+            
+            redisAppendCommandArgv(thread_data->mp_redis_connection, idx, args, NULL);
+            for(int i=2;i<idx;i++) {
+                free((void *)args[i]);
+            }
+            free(args);
+
+			std::string custkeys_cmd = "HGETALL " + server_key + "custkeys";
+			redisAppendCommand(thread_data->mp_redis_connection, custkeys_cmd.c_str());
+			it++;
+		}
+
+        for (size_t c = 0; c < server_keys.size(); c++) {
+            Server server;
+            
+            redisReply *basic_reply = NULL;
+            redisReply *custom_reply = NULL;
+            
+            redisGetReply(thread_data->mp_redis_connection,(void**)&basic_reply);
+            redisGetReply(thread_data->mp_redis_connection,(void**)&custom_reply);
+            
+            std::string server_key = server_keys.at(c);
+            
+            if (!LoadBasicServerInfo(&server, basic_reply)) {
+                keys_to_delete.push_back(server_key);
+                
+                if(basic_reply != NULL) {
+                    freeReplyObject(basic_reply);
+                }
+                if(custom_reply != NULL) {
+                    freeReplyObject(custom_reply);
+                }
+                continue;
+            }
+            
+            //skip deleted server
+            if (!req->include_deleted && server.deleted) {
+                if(basic_reply != NULL) {
+                    freeReplyObject(basic_reply);
+                }
+                if(custom_reply != NULL) {
+                    freeReplyObject(custom_reply);
+                }
+                continue;
+            }
+            LoadCustomServerInfo_AllKeys(&server, custom_reply);
+            server.kvFields["backend_id"] = server_key;
+            server.key = server_key;
+            server.game = req->m_for_game;
+            
+            if(basic_reply != NULL) {
+                freeReplyObject(basic_reply);
+            }
+            if(custom_reply != NULL) {
+                freeReplyObject(custom_reply);
+            }
+            
+            if (filterMatches(token_list, server.kvFields)) {
+                if (query_response->list.size() < req->max_results || req->max_results == 0) {
+                    
+                    //only load this data if its actually being sent
+                    if (req->all_player_keys) {
+                        LoadCustomInfo_AllPlayerKeys(thread_data, &server, server_key); //this is SLOW (it performs queries directly)
+                    }
+                    
+                    if (req->all_team_keys) {
+                        LoadCustomInfo_AllTeamKeys(thread_data, &server, server_key); //this is SLOW (it performs queries directly)
+                    }
+                    
+                    
+                    Server* _server = new Server();
+                    *_server = server;
+                    query_response->list.push_back(_server);
+                }
+            }
+        }
+        
+        std::vector<std::string>::iterator del_it = keys_to_delete.begin();
+        while(del_it != keys_to_delete.end()) {
+            std::string server_key = *del_it;
+            std::string gamename =  req->m_for_game.gamename; //incase of reference issue
+            const char *args[] = {"ZREM" , gamename.c_str(), server_key.c_str()};
+            redisAppendCommandArgv(thread_data->mp_redis_connection, 3, args, NULL);
+            del_it++;
+        }
+        
+        for(size_t i=0;i<keys_to_delete.size();i++) {
+            void *reply;
+            int r = redisGetReply(thread_data->mp_redis_connection, (void **)&reply);
+            if (r == REDIS_OK) {
+                freeReplyObject(reply);
+            }
+        }
+	}
+
+	void LoadCustomInfo_AllPlayerKeys(TaskThreadData* thread_data, MM::Server* server, std::string server_key) {
 		int idx = 0;
 
-		std::string key;
-		std::ostringstream s;		
+		redisReply *reply = NULL;
 
-		Redis::Value v, arr;
+		do {
+			std::ostringstream s;
+			s << server_key << "custkeys_player_" << idx;
 
-		std::map<std::string, std::string> all_cust_keys; //used for filtering
+			std::string key = s.str();
 
-		/*
-		XXX: add redis error checks, cleanup on error, etc
-		*/
+			reply = (redisReply *)redisCommand(thread_data->mp_redis_connection, "EXISTS %s", key.c_str());
 
-		Redis::SelectDb(thread_data->mp_redis_connection, OS::ERedisDB_QR);
+           if (reply == NULL || thread_data->mp_redis_connection->err) {
+				if(reply != NULL) {
+					freeReplyObject(reply);
+				}
+                break;
+            }
 
-		//skip deleted servers
-		if (!include_deleted) {
-			reply = Redis::Command(thread_data->mp_redis_connection, 0, "HGET %s deleted", entry_name.c_str());
-			if (reply.values.size() == 0 || reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR) {
-				return;
+			if(reply->type == REDIS_REPLY_STRING) {
+				if (!atoi(reply->str)) {
+					freeReplyObject(reply);
+					break;
+				}					
+			} else if(reply->type == REDIS_REPLY_INTEGER) {
+				if(!reply->integer) {
+					freeReplyObject(reply);
+					break;
+				}
 			}
-			v = reply.values[0];
-			if (v.type == Redis::REDIS_RESPONSE_TYPE_INTEGER && v.value._int == 1) {
-				return;
+
+
+			idx++;
+		} while (true);
+
+		if (idx == 0) {
+			return;
+		}
+
+		//we got the max player key, now dump them
+		for (int i = 0; i < idx; i++) {
+			std::ostringstream cmd;
+			cmd << "HGETALL " << server_key << "custkeys_player_" << i;
+			redisAppendCommand(thread_data->mp_redis_connection, cmd.str().c_str());
+		}
+
+		
+
+		for (int i = 0; i < idx; i++) {
+			int r = redisGetReply(thread_data->mp_redis_connection,(void**)&reply);
+
+			if(r == REDIS_OK) {
+				for(size_t c = 0; c < reply->elements; c += 2) {
+					std::string field_name = reply->element[c]->str;
+					std::string field_value = reply->element[c + 1]->str;
+					server->kvPlayers[i][field_name] = field_value;
+				}
+				
+				freeReplyObject(reply);
 			}
-			else if (v.type == Redis::REDIS_RESPONSE_TYPE_STRING && v.value._str.compare("1") == 0) {
-				return;
+		}
+	}
+
+	void LoadCustomInfo_AllTeamKeys(TaskThreadData* thread_data, MM::Server* server, std::string server_key) {
+		int idx = 0;
+
+		redisReply *reply = NULL;
+
+		do {
+			std::ostringstream s;
+			s << server_key << "custkeys_team_" << idx;
+
+			std::string key = s.str();
+
+			reply = (redisReply *)redisCommand(thread_data->mp_redis_connection, "EXISTS %s", key.c_str());
+
+           if (reply == NULL || thread_data->mp_redis_connection->err) {
+				if(reply != NULL) {
+					freeReplyObject(reply);
+				}
+                break;
+            }
+
+			if(reply->type == REDIS_REPLY_STRING) {
+				if (!atoi(reply->str)) {
+					freeReplyObject(reply);
+					break;
+				}					
+			} else if(reply->type == REDIS_REPLY_INTEGER) {
+				if(!reply->integer) {
+					freeReplyObject(reply);
+					break;
+				}
 			}
+
+
+			idx++;
+		} while (true);
+
+		if (idx == 0) {
+			return;
+		}
+
+		//we got the max player key, now dump them
+		for (int i = 0; i < idx; i++) {
+			std::ostringstream cmd;
+			cmd << "HGETALL " << server_key << "custkeys_team_" << i;
+			redisAppendCommand(thread_data->mp_redis_connection, cmd.str().c_str());
+		}
+
+		for (int i = 0; i < idx; i++) {
+			int r = redisGetReply(thread_data->mp_redis_connection,(void**)&reply);
+
+			if(r == REDIS_OK) {
+				for(size_t c = 0; c < reply->elements; c += 2) {
+					std::string field_name = reply->element[c]->str;
+					std::string field_value = reply->element[c + 1]->str;
+					server->kvTeams[i][field_name] = field_value;
+				}
+				
+				freeReplyObject(reply);
+			}
+		}
+	}
+
+	void AppendServerEntries(TaskThreadData* thread_data, std::vector<std::string> server_keys, ServerListQuery* query_response, const sServerListReq* req, int peer_version) {
+		std::vector<std::string> basic_lookup_keys;
+
+		std::vector<std::string> lookup_keys;
+
+		std::vector<CToken> token_list;
+
+		if (server_keys.empty()) {
+			return;
+		}
+
+		
+		if (req->all_keys) {
+			AppendServerEntries_AllKeys(thread_data, server_keys, query_response, req);
+			return;
+		}
+		
+		BuildServerListRequestData(req, basic_lookup_keys, lookup_keys, token_list, peer_version);
+
+		bool has_customkeys = !lookup_keys.empty();
+
+        std::vector<std::string> keys_to_delete;
+		std::vector<std::string>::iterator it = server_keys.begin();
+		while (it != server_keys.end()) {
+			std::string server_key = *it;
+            
+            int num_basic_keys = 2 + basic_lookup_keys.size();
+            const char **args = (const char **)malloc(num_basic_keys * sizeof(const char *));
+            args[0] = "HMGET";
+            args[1] = server_key.c_str();
+            
+            int idx = 2;
+            
+            std::vector<std::string>::iterator keys_it = basic_lookup_keys.begin();
+            while (keys_it != basic_lookup_keys.end()) {
+                std::string key = *keys_it;
+                args[idx++] = strdup(key.c_str());
+                keys_it++;
+            }
+            
+            redisAppendCommandArgv(thread_data->mp_redis_connection, idx, args, NULL);
+            for(int i=2;i<idx;i++) {
+                free((void *)args[i]);
+            }
+            free(args);
+
+			if (has_customkeys) {
+                std::string server_cust_key = server_key + "custkeys";
+                int num_cust_keys = 2 + lookup_keys.size();
+                idx = 2;
+                args = (const char **)malloc(num_cust_keys * sizeof(const char *));
+                args[0] = "HMGET";
+                args[1] = server_cust_key.c_str();
+                
+                keys_it = lookup_keys.begin();
+                while (keys_it != lookup_keys.end()) {
+                    std::string key = *keys_it;
+                    args[idx++] = strdup(key.c_str());
+                    keys_it++;
+                }
+                
+                redisAppendCommandArgv(thread_data->mp_redis_connection, idx, args, NULL);
+                
+                for(int i=2;i<idx;i++) {
+                    free((void *)args[i]);
+                }
+                free(args);
+			}
+			it++;
 		}
 
 
-		Server *server = new MM::Server();
+		it = server_keys.begin();
+		while (it != server_keys.end()) {
+			Server server;
 
-		reply = Redis::Command(thread_data->mp_redis_connection, 0, "HGET %s gameid", entry_name.c_str());
+			std::string server_key = *it;
 
-		if (reply.values.size() == 0 || reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR)
-			goto error_cleanup;
+			redisReply *basic_reply = NULL;
+			redisReply *custom_reply = NULL;
 
-		v = reply.values.front();
-		if(v.type == Redis::REDIS_RESPONSE_TYPE_STRING) {
-			std::string gameid_reply = (v.value._str).c_str();
-			int gameid = atoi(gameid_reply.c_str());
-			if (req) {
-				server->game = req->m_for_game;
+			redisGetReply(thread_data->mp_redis_connection,(void**)&basic_reply);
+            if (has_customkeys) {
+                redisGetReply(thread_data->mp_redis_connection,(void**)&custom_reply);
+            }
+
+			if (!LoadBasicServerInfo(&server, basic_reply)) {
+                
+				//server is deleted / doesn't exist, remove from cache
+				if (req) {
+                    keys_to_delete.push_back(server_key);
+				}
 			}
-			else {				
-				server->game = OS::GetGameByID(gameid, thread_data->mp_redis_connection);			
+			else if(req->include_deleted || server.deleted == false) {
+				if (has_customkeys && custom_reply) {
+					LoadCustomServerInfo(&server, lookup_keys, custom_reply);
+				}
+				server.kvFields["backend_id"] = server_key;
+                server.key = server_key;
+                server.game = req->m_for_game;
+
+				if (!req || filterMatches(token_list, server.kvFields)) {
+					if (!req || (query_response->list.size() < req->max_results || req->max_results == 0)) {
+						Server* _server = new Server();
+						*_server = server;
+						query_response->list.push_back(_server);
+					}
+				}
+			}
+            
+			if(basic_reply != NULL) {
+				freeReplyObject(basic_reply);
+			}
+			if(custom_reply != NULL) {
+				freeReplyObject(custom_reply);
 			}
 			
-			Redis::SelectDb(thread_data->mp_redis_connection, OS::ERedisDB_QR);
+			it++;
 		}
+        
+        std::vector<std::string>::iterator del_it = keys_to_delete.begin();
+        while(del_it != keys_to_delete.end()) { //delete cache misses
+            std::string server_key = *del_it;
+            std::string gamename =  req->m_for_game.gamename; //incase of reference issue
+            const char *args[] = {"ZREM" , gamename.c_str(), server_key.c_str()};
+            redisAppendCommandArgv(thread_data->mp_redis_connection, 3, args, NULL);
+            del_it++;
+        }
+        for(size_t i=0;i<keys_to_delete.size();i++) {
+            void *reply;
+            int r = redisGetReply(thread_data->mp_redis_connection, (void **)&reply);
+            if (r == REDIS_OK) {
+                freeReplyObject(reply);
+            }
+        }
+	}
+	
+	void LoadCustomServerInfo_AllKeys(MM::Server* server, redisReply* custom_keys_response) {
+		for (size_t i = 0; i < custom_keys_response->elements; i += 2) {
+			std::string field_name = custom_keys_response->element[i]->str;
+			std::string field_value = custom_keys_response->element[i + 1]->str;
+			server->kvFields[field_name] = field_value;
+		}
+	}
 
-		server->key = entry_name;
+	void LoadCustomServerInfo(MM::Server* server, std::vector<std::string>& custom_lookup_keys, redisReply* custom_keys_response) {
+		for (size_t i = 0; i < custom_keys_response->elements; i ++) {
+			if(custom_keys_response->element[i]->type != REDIS_REPLY_STRING) {
+				continue;
+			}
+			std::string field_name = custom_lookup_keys.at(i);
+			std::string field_value = custom_keys_response->element[i]->str;
+			server->kvFields[field_name] = field_value;
+		}
+	}
 
-		server->kvFields["backend_id"] = entry_name;
+	bool LoadBasicServerInfo(MM::Server* server, redisReply* basic_keys_response) {
+        if(!basic_keys_response) {
+            return false;
+        }
+		for(size_t i = 0; i < basic_keys_response->elements; i++) {
 
-		Redis::Command(thread_data->mp_redis_connection, 0, "ZINCRBY %s -1 \"%s\"", server->game.gamename.c_str(), entry_name.c_str());
-
-
-		reply = Redis::Command(thread_data->mp_redis_connection, 0, "HGET %s id", entry_name.c_str());
-		if (reply.values.size() == 0 || reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR)
-			goto error_cleanup;
-
-		v = reply.values.front();
-
-		if (v.type == Redis::REDIS_RESPONSE_TYPE_STRING)
-			server->id = atoi((v.value._str).c_str());
-
-		reply = Redis::Command(thread_data->mp_redis_connection, 0, "HGET %s wan_port", entry_name.c_str());
-
-		if (reply.values.size() == 0 || reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR)
-			goto error_cleanup;
-
-		v = reply.values.front();
-
-		if(v.type== Redis::REDIS_RESPONSE_TYPE_STRING)
-			server->wan_address.port = atoi((v.value._str).c_str());
-
-		reply = Redis::Command(thread_data->mp_redis_connection, 0, "HGET %s wan_ip", entry_name.c_str());
-
-		if (reply.values.size() == 0 || reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR)
-			goto error_cleanup;
-
-		v = reply.values.front();
-
-		if(v.type == Redis::REDIS_RESPONSE_TYPE_STRING)
-			server->wan_address.ip = inet_addr((v.value._str).c_str());
-
-		reply = Redis::Command(thread_data->mp_redis_connection, 0, "HGET %s icmp_address", entry_name.c_str());
-		if (reply.values.size() == 0 || reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR)
-			goto error_cleanup;
-
-		v = reply.values.front();
-
-		if (v.type == Redis::REDIS_RESPONSE_TYPE_STRING)
-			server->icmp_address.ip = inet_addr((v.value._str).c_str());
-
-		reply = Redis::Command(thread_data->mp_redis_connection, 0, "HGET %s allow_unsolicited_udp", entry_name.c_str());
-		if (reply.values.size() == 0 || reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR)
-			goto error_cleanup;
-
-		v = reply.values.front();
-
-		if (v.type == Redis::REDIS_RESPONSE_TYPE_STRING)
-			server->allow_unsolicited_udp = atoi((v.value._str).c_str()) != 0;
-
-		reply = Redis::Command(thread_data->mp_redis_connection, 0, "HGET %s country", entry_name.c_str());
-		if (reply.values.size() == 0 || reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR)
-			goto error_cleanup;
-
-		v = reply.values.front();
-
-		if (v.type == Redis::REDIS_RESPONSE_TYPE_STRING)
-			server->kvFields["country"] = v.value._str;
-
-		if(all_keys) {
-			do {
-				reply = Redis::Command(thread_data->mp_redis_connection, 0, "HSCAN %scustkeys %d MATCH *", entry_name.c_str(), cursor);
-				if (reply.values.size() == 0 || reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR || reply.values[0].arr_value.values.size() < 2)
-					goto error_cleanup;
-
-				v = reply.values[0].arr_value.values[0].second;
-				arr = reply.values[0].arr_value.values[1].second;
-
-				if (arr.type == Redis::REDIS_RESPONSE_TYPE_ARRAY) {
-					if(v.type == Redis::REDIS_RESPONSE_TYPE_STRING) {
-						cursor = atoi(v.value._str.c_str());
-					} else if(v.type == Redis::REDIS_RESPONSE_TYPE_INTEGER) {
-						cursor = v.arr_value.values[0].second.value._int;
-					}
-
-					for(size_t i=0;i<arr.arr_value.values.size();i+=2) {
-
-						if(arr.arr_value.values[1].first != Redis::REDIS_RESPONSE_TYPE_STRING)
-							continue;
-
-						std::string key = arr.arr_value.values[i].second.value._str;
-						if (arr.arr_value.values[i+1].first == Redis::REDIS_RESPONSE_TYPE_STRING) {
-							server->kvFields[key] = (arr.arr_value.values[i + 1].second.value._str);
-						}
-						else if(arr.arr_value.values[i + 1].first == Redis::REDIS_RESPONSE_TYPE_INTEGER) {
-							server->kvFields[key] = arr.arr_value.values[i + 1].second.value._int;
-						}
-
-						if(std::find(ret->captured_basic_fields.begin(), ret->captured_basic_fields.end(), key) == ret->captured_basic_fields.end()) {
-							ret->captured_basic_fields.push_back(key);
-						}
+			if (basic_keys_response->element[i]->type != REDIS_REPLY_STRING) {
+				continue;
+			}
+			switch (i) {
+			case 0:
+				if (basic_keys_response->element[i]->type != REDIS_REPLY_NIL) {
+					if (atoi(basic_keys_response->element[i]->str) != 0) {
+						//mark as deleted (we only remove non-existent from the cache)
+						server->deleted = true;
 					}
 				}
-			} while (cursor != 0);
-			cursor = 0;
-			do {
-				s << entry_name << "custkeys_player_" << idx;
-				key = s.str();
+				break;
+			case 1:
+				server->game.gameid = atoi(basic_keys_response->element[i]->str);
+				break;
+			case 2:
+				server->id = atoi(basic_keys_response->element[i]->str);
+				break;
+			case 3:
+				server->wan_address.port = atoi(basic_keys_response->element[i]->str);
+				break;
+			case 4:
+				server->wan_address.ip = inet_addr(basic_keys_response->element[i]->str);
+				break;
+			case 5:
+				server->icmp_address.ip = inet_addr(basic_keys_response->element[i]->str);
+				break;
+			case 6:
+				server->allow_unsolicited_udp = atoi(basic_keys_response->element[i]->str);
+				break;
+			case 7:
+				server->kvFields["country"] = basic_keys_response->element[i]->str;
+				break;
 
-				reply = Redis::Command(thread_data->mp_redis_connection, 0, "EXISTS %s", key.c_str());
-				if (reply.values.size() == 0 || reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR)
-					break;
-
-				v = reply.values.front();
-				if (v.type == Redis::REDIS_RESPONSE_TYPE_INTEGER) {
-					if (!v.value._int)
-						break;
-				}
-				else if (v.type == Redis::REDIS_RESPONSE_TYPE_STRING) {
-					if (!atoi(v.value._str.c_str()))
-						break;
-				}
-
-				cursor = 0;
-				do {
-					reply = Redis::Command(thread_data->mp_redis_connection, 0, "HSCAN %s %d MATCH *", key.c_str(), cursor);
-
-					if (reply.values[0].arr_value.values.size() < 2) {
-						goto error_cleanup;
-					}
-
-					v = reply.values[0].arr_value.values[0].second;
-					arr = reply.values[0].arr_value.values[1].second;
-					if (arr.arr_value.values.size() < 2)
-						break;
-
-					for (size_t i = 0; i<arr.arr_value.values.size(); i += 2) {
-
-						if (arr.arr_value.values[1].first != Redis::REDIS_RESPONSE_TYPE_STRING)
-							continue;
-
-						std::string key = arr.arr_value.values[i].second.value._str;
-						if (arr.arr_value.values[i + 1].first == Redis::REDIS_RESPONSE_TYPE_STRING) {
-							server->kvPlayers[idx][key] = (arr.arr_value.values[i + 1].second.value._str);
-						}
-						else if (arr.arr_value.values[i + 1].first == Redis::REDIS_RESPONSE_TYPE_INTEGER) {
-							server->kvPlayers[idx][key] = arr.arr_value.values[i + 1].second.value._int;
-						}
-
-						if (std::find(ret->captured_team_fields.begin(), ret->captured_team_fields.end(), arr.arr_value.values[i].second.value._str) == ret->captured_team_fields.end()) {
-							ret->captured_player_fields.push_back(arr.arr_value.values[i].second.value._str);
-						}
-					}
-					s.str("");
-				} while (cursor != 0);
-				idx++;
-			} while (true);
-			s.str("");
-
-			idx = 0;
-
-			do {
-				s.str("");
-				s << entry_name << "custkeys_team_" << idx;
-				key = s.str();
-
-				reply = Redis::Command(thread_data->mp_redis_connection, 0, "EXISTS %s", key.c_str());
-				if (reply.values.size() == 0 || reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR)
-					break;
-
-				v = reply.values.front();
-				if (v.type == Redis::REDIS_RESPONSE_TYPE_INTEGER) {
-					if (!v.value._int)
-						break;
-				}
-				else if (v.type == Redis::REDIS_RESPONSE_TYPE_STRING) {
-					if (!atoi(v.value._str.c_str()))
-						break;
-				}
-
-				cursor = 0;
-				do {
-					reply = Redis::Command(thread_data->mp_redis_connection, 0, "HSCAN %s %d MATCH *", key.c_str(), cursor);
-					if (reply.values.size() < 2|| reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR || reply.values[0].arr_value.values.size() < 2)
-						break;
-
-					v = reply.values[0];
-					arr = reply.values[1];
-
-					if (v.type == Redis::REDIS_RESPONSE_TYPE_ARRAY) {
-						if (v.arr_value.values.size() <= 0) {
-							break;
-						}
-						for (size_t i = 0; i<arr.arr_value.values.size(); i += 2) {
-
-							if (arr.arr_value.values[1].first != Redis::REDIS_RESPONSE_TYPE_STRING)
-								continue;
-
-							std::string key = arr.arr_value.values[i].second.value._str;
-							if (arr.arr_value.values[i + 1].first == Redis::REDIS_RESPONSE_TYPE_STRING) {
-								server->kvTeams[idx][key] = (arr.arr_value.values[i + 1].second.value._str);
-							}
-							else if (arr.arr_value.values[i + 1].first == Redis::REDIS_RESPONSE_TYPE_INTEGER) {
-								server->kvTeams[idx][key] = arr.arr_value.values[i + 1].second.value._int;
-							}
-
-							if(std::find(ret->captured_team_fields.begin(), ret->captured_team_fields.end(), arr.arr_value.values[i].second.value._str) == ret->captured_team_fields.end()) {
-								ret->captured_team_fields.push_back(arr.arr_value.values[i].second.value._str);
-							}
-						}
-					}
-				} while(cursor != 0);
-				idx++;
-			} while(true);
-
-			idx = 0;
-			all_cust_keys = server->kvFields;
-		} else {
-			do {
-				reply = Redis::Command(thread_data->mp_redis_connection, 0, "HSCAN %scustkeys %d MATCH *", entry_name.c_str(), cursor);
-				if (reply.values.size() == 0 || reply.values.front().type == Redis::REDIS_RESPONSE_TYPE_ERROR || reply.values[0].arr_value.values.size() < 2)
-					goto error_cleanup;
-
-				v = reply.values[0].arr_value.values[0].second;
-				arr = reply.values[0].arr_value.values[1].second;
-
-				if (arr.type == Redis::REDIS_RESPONSE_TYPE_ARRAY) {
-					if (v.type == Redis::REDIS_RESPONSE_TYPE_STRING) {
-						cursor = atoi(v.value._str.c_str());
-					}
-					else if (v.type == Redis::REDIS_RESPONSE_TYPE_INTEGER) {
-						cursor = v.arr_value.values[0].second.value._int;
-					}
-
-					for (size_t i = 0; i<arr.arr_value.values.size(); i += 2) {
-
-						if (arr.arr_value.values[1].first != Redis::REDIS_RESPONSE_TYPE_STRING)
-							continue;
-
-						std::string key = arr.arr_value.values[i].second.value._str;
-						if (arr.arr_value.values[i + 1].first == Redis::REDIS_RESPONSE_TYPE_STRING) {
-							server->kvFields[key] = (arr.arr_value.values[i + 1].second.value._str);
-						}
-						else if (arr.arr_value.values[i + 1].first == Redis::REDIS_RESPONSE_TYPE_INTEGER) {
-							server->kvFields[key] = arr.arr_value.values[i + 1].second.value._int;
-						}
-
-						if (std::find(ret->captured_basic_fields.begin(), ret->captured_basic_fields.end(), arr.arr_value.values[i].second.value._str) == ret->captured_basic_fields.end()) {
-							ret->captured_basic_fields.push_back(arr.arr_value.values[i].second.value._str);
-						}
-					}
-				}
-			} while(cursor != 0);
-
-
-			all_cust_keys = server->kvFields;
-			if(req->all_keys == false) {
-				server->kvFields.clear(); //remove all keys
-				std::map<std::string, std::string>::iterator it = all_cust_keys.begin();
-				while(it != all_cust_keys.end()) {
-					std::pair<std::string, std::string> p = *it;
-
-					//add only keys which were requested
-					if(std::find(ret->requested_fields.begin(), ret->requested_fields.end(), p.first) != ret->requested_fields.end()) {
-						server->kvFields[p.first] = p.second;
-					}
-					it++;
-				}
 			}
 		}
 
-		if(!req || filterMatches(req->filter.c_str(), all_cust_keys)) {
-			if (!req || (ret->list.size() < req->max_results || req->max_results == 0)) {
-				ret->list.push_back(server);
-			} else {
-				delete server;
-			}
+		//if the ip is null its an invalid server
+		if (server->wan_address.ip == 0) {
+			return false;
 		}
-		else {
-			delete server;
-		}
-		goto true_exit;
-
-	error_cleanup:
-			delete server;
-	true_exit:
-		Redis::SelectDb(thread_data->mp_redis_connection, OS::ERedisDB_QR);
-    }
+		return true;
+	}
 }

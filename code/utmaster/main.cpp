@@ -22,20 +22,46 @@ void sig_handler(int signo)
 
 std::string get_file_contents(std::string path) {
 	std::string ret;
-	FILE *fd = fopen(path.c_str(),"r");
+	FILE *fd = fopen(path.c_str(),"rb");
 	if(fd) {
-		fseek(fd,0,SEEK_END);
-		int len = ftell(fd);
-		fseek(fd,0,SEEK_SET);
-
-		char *str_data = (char *)malloc(len+1);
-		fread(str_data, len, 1, fd);
-		str_data[len] = 0;
-		ret = str_data;
-		free((void *)str_data);
+		while(1) {
+			uint8_t ch;
+			int len = fread(&ch, sizeof(uint8_t), 1, fd);
+			if (len != sizeof(uint8_t)) break;
+			ret += ch;
+		}
+		fclose(fd);
 	}
-	fclose(fd);
+	
 	return ret;
+}
+
+void load_packages_data(UT::Config* cfg, std::vector<OS::ConfigNode> nodes) {
+	std::vector<OS::ConfigNode>::iterator it = nodes.begin();
+	while (it != nodes.end()) {
+		UT::PackageItem item;
+
+		OS::ConfigNode root = *it;
+		std::vector<OS::ConfigNode> children = root.GetArrayChildren();
+		std::vector<OS::ConfigNode>::iterator it2 = children.begin();
+		while (it2 != children.end()) {
+
+			OS::ConfigNode child = *it2;
+			std::string key = child.GetKey();
+			if (key.compare("guid") == 0) {
+				item.guid = child.GetValue();
+			}
+			else if (key.compare("md5hash") == 0) {
+				item.hash = child.GetValue();
+			}
+			else if (key.compare("version") == 0) {
+				item.version = child.GetValueInt();
+			}
+			it2++;
+		}
+		cfg->packages.push_back(item);
+		it++;
+	}
 }
 
 std::vector<UT::Config *> LoadConfigMapping(std::string filePath) {
@@ -67,6 +93,8 @@ std::vector<UT::Config *> LoadConfigMapping(std::string filePath) {
 					msConfig->motd = get_file_contents(configNode.GetValue());
 				} else if(key.compare("latest-client-version") == 0) {
 					msConfig->latest_client_version = atoi(configNode.GetValue().c_str());
+				} else if (key.compare("packages") == 0) {
+					load_packages_data(msConfig, configNode.GetArrayChildren());
 				}
 				it2++;
 			}

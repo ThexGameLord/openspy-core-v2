@@ -11,10 +11,10 @@
 #include <algorithm>
 
 #include <OS/Buffer.h>
-
 #include <OS/KVReader.h>
-
 #include <OS/Net/NetServer.h>
+
+#include <filter/CToken.h>
 
 namespace SB {
 		V1Peer::V1Peer(Driver *driver, INetIOSocket *sd) : SB::Peer(driver, sd, 1) {
@@ -32,7 +32,7 @@ namespace SB {
 		V1Peer::~V1Peer() {
 
 		}
-		void V1Peer::Delete(bool timeout = false) {
+		void V1Peer::Delete(bool timeout) {
 			if(m_enctype == 1) {
 				Enctype1_FlushPackets();
 			}
@@ -64,11 +64,7 @@ namespace SB {
 			if (m_delete_flag) return;
 			if (m_waiting_gamedata == 2) {
 				m_waiting_gamedata = 0;
-				while (!m_waiting_packets.empty()) {
-					std::string cmd = m_waiting_packets.front();
-					m_waiting_packets.pop();
-					handle_packet(cmd);
-				}
+                flushWaitingPackets();
 			}
 			if (packet_waiting) {
 				OS::Buffer recv_buffer;
@@ -179,7 +175,6 @@ namespace SB {
 			req.type = MM::EMMQueryRequestType_GetGameInfoByGameName;
 			m_waiting_gamedata = 1;
 			req.gamenames[0] = gamename;
-			req.extra = (void *)2;
 			m_enctype = enctype;
 			AddRequest(req);
 		}
@@ -226,54 +221,47 @@ namespace SB {
 		}
 		void V1Peer::OnRetrievedServerInfo(const MM::MMQueryRequest request, MM::ServerListQuery results, void *extra) {
 			SendServerInfo(results);
+            //if(results.last_set) {
+            //   Delete();
+            //}
 		}
 		void V1Peer::OnRetrievedServers(const MM::MMQueryRequest request, MM::ServerListQuery results, void *extra) {
 			if (request.req.all_keys) {
 				SendServerInfo(results);
 			}
-			else {
-				SendServers(results);
-			}			
+            else {
+                SendServers(results);
+            }
+            if(results.last_set) {
+                Delete();
+            }
 		}
 		void V1Peer::OnRetrievedGroups(const MM::MMQueryRequest request, MM::ServerListQuery results, void *extra) {
 			SendGroups(results);
+            
+            if(results.last_set) {
+                Delete();
+            }
 		}
 		void V1Peer::OnRecievedGameInfo(const OS::GameData game_data, void *extra) {
-			
-			size_t type = (size_t)extra;
 			m_waiting_gamedata = 2;
-
-			if (type == 1) {
-				if (game_data.secretkey[0] == 0) {
-					send_error(true, "Invalid target gamename");
-					return;
-				}
-				MM::MMQueryRequest req;
-				m_last_list_req.m_from_game = m_game;
-				m_last_list_req.m_for_game = game_data;
-
-				req.req = m_last_list_req;
-				req.type = req.req.send_groups ? MM::EMMQueryRequestType_GetGroups : MM::EMMQueryRequestType_GetServers;
-				AddRequest(req);
-			}
-			else if (type == 2) {
-				char realvalidate[16];
-				if (game_data.secretkey[0] == 0) {
-					send_error(true, "Invalid source gamename");
-					return;
-				}
-				m_game = game_data;
-				gsseckey((unsigned char *)&realvalidate, (const char *)&m_challenge, (const unsigned char *)m_game.secretkey.c_str(), m_enctype);
-				if(!m_validated) {
-					if(strcmp(realvalidate,m_validation.c_str()) == 0) {
-						m_validated = true;
-					} else {
-						send_error(true, "Validation error");
-						return;
-					}
-				}
-			}
+            char realvalidate[16];
+            if (game_data.secretkey[0] == 0) {
+                send_error(true, "Invalid source gamename");
+                return;
+            }
+            m_game = game_data;
+            gsseckey((unsigned char *)&realvalidate, (const char *)&m_challenge, (const unsigned char *)m_game.secretkey.c_str(), m_enctype);
+            if(!m_validated) {
+                if(strcmp(realvalidate,m_validation.c_str()) == 0) {
+                    m_validated = true;
+                } else {
+                    send_error(true, "Validation error");
+                    return;
+                }
+            }
 			FlushPendingRequests();
+            flushWaitingPackets();
 		}
 		void V1Peer::handle_list(std::string data) {
 			std::string mode, gamename;
@@ -298,8 +286,6 @@ namespace SB {
 			req.req.m_for_gamename = gamename;
 			req.req.m_from_game = m_game;
 			req.req.all_keys = false;
-
-
 			req.type = MM::EMMQueryRequestType_GetGameInfoByGameName;
 			m_waiting_gamedata = 1;
 			req.req.send_groups = false;
@@ -324,8 +310,13 @@ namespace SB {
 
 			OS::LogText(OS::ELogLevel_Info, "[%s] List Request: gamenames: (%s) - (%s), filter: %s  is_group: %d, all_keys: %d", getAddress().ToString().c_str(), req.req.m_from_game.gamename.c_str(), req.req.m_for_gamename.c_str(), req.req.filter.c_str(), req.req.send_groups, req.req.all_keys);
 
-			req.extra = (void *)1;
+            req.req.m_for_game.gamename = gamename;
+            req.type = req.req.send_groups ? MM::EMMQueryRequestType_GetGroups : MM::EMMQueryRequestType_GetServers;
+			
 			m_last_list_req = req.req;
+
+			m_last_list_req_token_list = CToken::filterToTokenList(m_last_list_req.filter.c_str());
+
 			AddRequest(req);
 			// //server disconnects after this
 		}
@@ -458,7 +449,7 @@ namespace SB {
 		void V1Peer::Enctype1_FlushPackets() {
 			OS::Buffer encrypted_buffer;
 
-			create_enctype1_buffer(m_challenge, m_enctype1_accumulator, encrypted_buffer);
+			create_enctype1_buffer((const char *)&m_challenge, m_enctype1_accumulator, encrypted_buffer);
 
 			this->GetDriver()->getNetIOInterface()->streamSend(m_sd, encrypted_buffer);
 		}
@@ -528,16 +519,27 @@ namespace SB {
 		void V1Peer::OnRecievedGameInfoPair(const OS::GameData game_data_first, const OS::GameData game_data_second, void *extra) {
 		}
 		std::string V1Peer::skip_queryid(std::string s) {
-		if (s.substr(0, 9).compare("\\queryid\\") == 0) {
-			s = s.substr(9);
-			size_t queryid_offset = s.find("\\");
-			if (queryid_offset != std::string::npos) {
-				if (s.length() > queryid_offset) {
-					queryid_offset++;
+			if (s.substr(0, 9).compare("\\queryid\\") == 0) {
+				s = s.substr(9);
+				size_t queryid_offset = s.find("\\");
+				if (queryid_offset != std::string::npos) {
+					if (s.length() > queryid_offset) {
+						queryid_offset++;
+					}
+					s = s.substr(queryid_offset);
 				}
-				s = s.substr(queryid_offset);
 			}
+
+			if (s.substr(0, 2).compare("\r\n") == 0) { //skip new lines (for unreal)... probably should rename this function
+				s = s.substr(2);
+			}
+			return s;
 		}
-		return s;
-		}
+        void V1Peer::flushWaitingPackets() {
+            while (!m_waiting_packets.empty()) {
+                std::string cmd = m_waiting_packets.front();
+                m_waiting_packets.pop();
+                handle_packet(cmd);
+            }
+        }
 }

@@ -15,13 +15,12 @@ namespace UT {
 		if(m_config->is_server) return;
 		OS::Buffer send_buffer;
 
-		send_buffer.WriteByte(0x6A);
-		send_buffer.WriteByte(0x16);
-		
-		send_buffer.WriteNTS(m_config->motd);
-		if(m_client_version >= 3000)
-			send_buffer.WriteInt(0);
+		Write_FString(m_config->motd, send_buffer);
+
+		if (m_client_version >= 3000)
+			send_buffer.WriteInt(0); //some kind of status, non-zero = update button lickable
 		send_packet(send_buffer);
+		Delete();
 	}
 
 }

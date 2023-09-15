@@ -14,80 +14,73 @@ namespace UT {
 
 		std::stringstream ss;
 		
-		//read unknown properties
-		uint8_t num_addresses = buffer.ReadByte();
+		//read addresses
+		int num_addresses = Read_CompactInt(buffer);
 		ss << "Clients (";
 		while(num_addresses--) {
-			std::string ip_address = Read_FString(buffer);		
+			std::string ip_address = Read_FString(buffer, true);
 			ss << ip_address << " ";			
 		}
 		ss << ") ";
-		buffer.ReadByte(); //??
-		/*uint32_t unk2 =*/ buffer.ReadInt(); 
 
-		record.m_address.port = htons(buffer.ReadShort());
-		ss << " Address: " << record.m_address.ToString();
+		ss << " Unk1: " << buffer.ReadInt(); //unknown data
 
-		//read more unknown properties
-		buffer.ReadByte(); buffer.ReadByte(); buffer.ReadByte();
-		
+		ss << " Address: " << Read_FString(buffer, true);
 
+		record.m_address.port = htons(buffer.ReadInt());
+		ss << " Port: " << record.m_address.ToString();
+		ss << " Unk2: " << buffer.ReadInt();
 
-		/*int hostname_len =*/ buffer.ReadInt();
-		record.hostname = buffer.ReadNTS();
+		record.hostname = Read_FString(buffer, true);
 		ss << " Hostname: " << record.hostname;
 
-		record.level = Read_FString(buffer);
+		record.level = Read_FString(buffer, true);
 		ss << " Level: " << record.level;
 
-		record.game_group = Read_FString(buffer);
+		record.game_group = Read_FString(buffer, true);
 		ss << " Game group: " << record.game_group;
 
 		int num_players = buffer.ReadInt(), max_players = buffer.ReadInt(); /*, unk5 = buffer.ReadInt(); */ 
-		buffer.ReadInt(); //unk5
+		ss << " Unk3: " << buffer.ReadInt();
 		
-		if(m_client_version >= 3000) {
-			/*uint32_t unk6 = */buffer.ReadInt();//, unk7 = buffer.ReadInt();
-		}
 		record.num_players = num_players;
 		record.max_players = max_players;
 		ss << " Players: (" << record.num_players << "/" << record.max_players << ") ";
 		
 		if(m_client_version >= 3000) {
-			/*uint8_t unk7 =*/ buffer.ReadByte(), /*unk8 =*/ buffer.ReadByte(), /*unk9 =*/ buffer.ReadByte();
+			ss << " Unk4: " << buffer.ReadInt();
+
+			record.bot_level = Read_FString(buffer, true);
+			ss << " Bot: " << record.bot_level << " ";
 		}
 		
-		uint8_t num_fields = buffer.ReadByte();
+		int num_fields = Read_CompactInt(buffer);
 
 		for(int i=0;i<num_fields;i++) {
-			std::string field = Read_FString(buffer);
-			std::string property = Read_FString(buffer);
+			std::string field = Read_FString(buffer, true);
+			std::string property = Read_FString(buffer, true);
 
 			ss << "(" << field << "," << property << "), ";
 
-
-			if(stricmp(field.c_str(),"mutator") == 0) {
+			if(field.compare("mutator") == 0) {
 				record.m_mutators.push_back(property);
 			} else {
 				record.m_rules[field] = property;
 			}
 		} 
-		uint8_t num_player_entries = buffer.ReadByte();
+		int num_player_entries = Read_CompactInt(buffer);
 		
 		ss << " Players (";
 		for(int i=0;i<num_player_entries;i++) {
 			MM::PlayerRecord player_record;
-			/*uint8_t player_index =*/ buffer.ReadByte();
-			/*int name_len =*/ buffer.ReadInt();
-			
-
-			player_record.name = buffer.ReadNTS();
+			player_record.id = buffer.ReadInt();
+			player_record.name = Read_FString(buffer, true);
 
 			player_record.ping = buffer.ReadInt();
 			player_record.score = buffer.ReadInt();
 			player_record.stats_id = buffer.ReadInt();
 
-			ss << player_record.name << "(" << player_record.ping << "," << player_record.score << "," << player_record.stats_id << "),";
+			ss << player_record.name << "(" << player_record.id << "," << player_record.ping << "," << player_record.score << "," << player_record.stats_id << "),";
 			
 			record.m_players.push_back(player_record);
 		}
@@ -112,51 +105,12 @@ namespace UT {
 
 	}
 
-
-    //this seems to be more stats related... but here for now, happens on non-stats games as well, just not much data
-	void Peer::handle_newserver_request(OS::Buffer recv_buffer) {
-		/*int unk1 =*/ recv_buffer.ReadInt();
-		if(recv_buffer.readRemaining() > 0) {
-			
-			/*int unk2 =*/ recv_buffer.ReadInt();
-			/*int unk3 =*/ recv_buffer.ReadInt();
-			bool continue_parse = true;
-			std::string accumulated_string;
-			while(continue_parse) {			
-				while(true) {
-					char b = recv_buffer.ReadByte();
-					if(b == 0x00 || b == 0x09) {
-						if(b == 0x0) {
-							continue_parse = false;
-							break;
-						}
-						accumulated_string = "";	
-					} else {
-						accumulated_string += b;
-					}
-				}
-			}
-			/*int unk4 =*/ recv_buffer.ReadInt();
-			/*int unk5 =*/ recv_buffer.ReadInt();
-			continue_parse = true;
-			accumulated_string = "";
-			while(continue_parse) {			
-				while(true) {
-					char b = recv_buffer.ReadByte();
-					if(b == 0x00 || b == 0x09) {
-						if(b == 0x0) {
-							continue_parse = false;
-							break;
-						}
-						accumulated_string = "";	
-					} else {
-						accumulated_string += b;
-					}
-				}
-			}
-			OS::LogText(OS::ELogLevel_Info, "[%s] Stats Init: %s", getAddress().ToString().c_str(), accumulated_string.c_str());
-		}
-		send_server_id(1234); //init stats backend, generate match id, for now not needed
+	void Peer::send_heartbeat_request(uint8_t id, uint32_t code) {
+		OS::Buffer send_buffer;
+		send_buffer.WriteByte(EServerOutgoingRequest_RequestHeartbeat);
+		send_buffer.WriteByte(id);
+		send_buffer.WriteInt(code);
+		send_packet(send_buffer);
 	}
 	void Peer::send_server_id(int id) {
 		OS::Buffer send_buffer;

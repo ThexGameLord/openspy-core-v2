@@ -12,6 +12,7 @@
 
 #define READ_BUFFER_SIZE 4096
 
+class CToken;
 
 namespace SB {
 	class Driver;
@@ -32,6 +33,8 @@ namespace SB {
 		
 		bool serverMatchesLastReq(MM::Server *server, bool require_push_flag = true);
 
+		int GetVersion() { return m_version; }
+
 		virtual void informDeleteServers(MM::Server *server) = 0;
 		virtual void informNewServers(MM::Server *server) = 0;
 		virtual void informUpdateServers(MM::Server *server) = 0;
@@ -51,6 +54,7 @@ namespace SB {
 
 		struct timeval m_last_recv, m_last_ping;
 
+		std::vector<CToken> m_last_list_req_token_list;
 		MM::sServerListReq m_last_list_req;
 
 		void AddRequest(MM::MMQueryRequest req);

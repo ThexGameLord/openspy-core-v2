@@ -36,7 +36,7 @@ namespace SB {
 			return false;
 		}*/
 		if(server->game.gameid == m_last_list_req.m_for_game.gameid) {
-			if(m_last_list_req.filter.length() == 0 || filterMatches(m_last_list_req.filter.c_str(), server->kvFields)) {
+			if(m_last_list_req.filter.length() == 0 || filterMatches(m_last_list_req_token_list, server->kvFields)) {
 				return true;
 			}
 			
@@ -70,6 +70,7 @@ namespace SB {
 	}
 
 	void Peer::Delete(bool timeout) {
+        CloseSocket();
 		m_timeout_flag = timeout;
 		m_delete_flag = true;
 	}
